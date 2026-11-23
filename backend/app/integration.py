@@ -20,9 +20,10 @@ from typing import Any
 from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
-    DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
-    SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
+    DeliveryReceipt, DeliveryTask, DiffRecord, ExtractRule, IncrCursor,
+    LayeredReleaseReport, ParseLogEntry, ProxyNode, QualitySample,
+    RawExtractedContent, SampleMethod, SchedulePlan, SiteConfig, SiteType,
+    StorageBatch, StratumSampleResult, UrlFingerprint,
 )
 from app.store import store
 
@@ -337,6 +338,177 @@ def deliver_and_sample(batch: StorageBatch) -> tuple[DeliveryTask | None, Qualit
 
 
 # ---------------------------------------------------------------------------
+# 流水线 4b: 分层放行报告 → 分层投递 → 收据（幂等重放、不可变留痕）
+# ---------------------------------------------------------------------------
+
+# 内存登记本：收据与报告对象，供补检回执重放和周报回查使用。
+_receipt_registry: dict[str, DeliveryReceipt] = {}
+_report_registry: dict[str, LayeredReleaseReport] = {}
+
+
+def zone_of(record: CleanedContent) -> str:
+    """按记录的来源分区归类：优先取显式分区标记，其次从来源 URL 提取。"""
+    zone = record.fields.get("分区") or record.fields.get("zone")
+    if zone:
+        return str(zone)
+    marker = record.source_url.split("://", 1)[-1].split("/", 1)[0]
+    return str(marker) if marker else "未分区"
+
+
+def build_layered_release_report(
+    batch: StorageBatch,
+    *,
+    min_samples: int = 3,
+    valid_rate_threshold: float = 0.9,
+    sample_sizes: dict[str, int] | None = None,
+    rng_seed: int | None = None,
+) -> LayeredReleaseReport:
+    """对同批次不同来源（分区）做分层采样并出具分层放行报告。
+
+    - 每个分区按 ``sample_sizes[分区]`` 采样，未指定时默认取 ``min_samples``
+      条（不足则全检）；
+    - 采样数量低于最小样本数，或有效率低于阈值的分区不放行；
+    - 同批次补检后重检会生成修订版报告（revision 递增），历史报告原样保留。
+    """
+    sample_sizes = sample_sizes or {}
+    rng = random.Random(rng_seed if rng_seed is not None else hash(batch.batch_id) & 0xFFFFFFFF)
+
+    grouped: dict[str, list[CleanedContent]] = {}
+    for record in batch.records:
+        grouped.setdefault(zone_of(record), []).append(record)
+
+    strata: list[StratumSampleResult] = []
+    for zone in sorted(grouped):
+        records = grouped[zone]
+        wanted = sample_sizes.get(zone, min_samples)
+        sample_size = min(wanted, len(records))
+        sampled = rng.sample(records, sample_size) if sample_size else []
+        valid_count = sum(1 for item in sampled if item.is_valid())
+        stratum = StratumSampleResult(
+            zone=zone,
+            total_rows=len(records),
+            sample_size=sample_size,
+            valid_count=valid_count,
+            min_samples=min_samples,
+            valid_rate_threshold=valid_rate_threshold,
+        )
+        stratum.evaluate()
+        # 放行后可投递的实际行数即该分区全部有效数据。
+        if stratum.approved:
+            stratum.delivered_rows = sum(1 for item in records if item.is_valid())
+        strata.append(stratum)
+
+    revision = sum(
+        1 for row in store.rows("layered_release")
+        if row.get("目标批次") == batch.batch_id
+    ) + 1
+    report = LayeredReleaseReport(
+        report_id=f"LRR-{batch.batch_id}-R{revision}",
+        target_batch=batch.batch_id,
+        min_samples=min_samples,
+        valid_rate_threshold=valid_rate_threshold,
+        strata=strata,
+        revision=revision,
+    ).finalize()
+    _report_registry[report.report_id] = report
+    _persist_layered_report(report)
+    return report
+
+
+def _find_or_create_delivery_task(batch: StorageBatch,
+                                  report: LayeredReleaseReport) -> DeliveryTask:
+    rows = store.rows("data_delivery")
+    for row in rows:
+        if row.get("数据来源") == batch.batch_id:
+            task = DeliveryTask.from_seed_row(row)
+            task.batch_ref_id = batch.batch_id
+            task.release_report_id = report.report_id
+            return task
+    task = DeliveryTask(
+        task_id=f"DEL-{batch.batch_id}",
+        data_source=batch.batch_id,
+        target_system=f"data_warehouse_{batch.source_job_id}",
+        delivery_format=DeliveryFormat.CSV,
+        frequency="manual",
+        partition_strategy="by_zone",
+        batch_ref_id=batch.batch_id,
+        release_report_id=report.report_id,
+    )
+    return task
+
+
+def deliver_approved_partitions(batch: StorageBatch,
+                                report: LayeredReleaseReport) -> tuple[DeliveryTask, list[DeliveryReceipt]]:
+    """按分层放行报告的已批准分区发送实际数据并登记收据。
+
+    只投递报告中「已批准」的分区；低于样本下限或有效率不足的分区不会被
+    登记为已收。收据按 (批次, 分区) 生成稳定编号，重复提交只记一次。
+    """
+    task = _find_or_create_delivery_task(batch, report)
+    approved = {s.zone: s for s in report.strata if s.status == "已批准"}
+
+    receipts: list[DeliveryReceipt] = []
+    for zone, stratum in approved.items():
+        receipt_id = f"RCP-{batch.batch_id}-{zone}"
+        existing = _receipt_registry.get(receipt_id)
+        if existing is not None:
+            # 补检回执重复提交只记一次：保留原收据原样。
+            receipts.append(existing)
+            continue
+        receipt = DeliveryReceipt(
+            receipt_id=receipt_id,
+            report_id=report.report_id,
+            target_batch=batch.batch_id,
+            task_id=task.task_id,
+            target_system=task.target_system,
+            partition=zone,
+            row_count=stratum.delivered_rows,
+            sample_size=stratum.sample_size,
+            valid_count=stratum.valid_count,
+        )
+        _receipt_registry[receipt_id] = receipt
+        _persist_receipt(receipt)
+        receipts.append(receipt)
+
+    # 同步抽样结论到数据投递清单：只登记已批准分区及其行数。
+    task.delivered_partitions = sorted(approved)
+    task.delivered_row_count = sum(item.row_count for item in receipts)
+    task.receipt_ids = sorted(item.receipt_id for item in receipts)
+    task.last_delivery = datetime.now(timezone.utc).isoformat()
+    if not approved:
+        task.status = "投递失败"
+    elif report.all_approved:
+        task.status = "已完成"
+    else:
+        task.status = "投递中"
+    _persist_delivery(task)
+    return task, receipts
+
+
+def replay_delivery_receipts(batch: StorageBatch,
+                             report: LayeredReleaseReport) -> list[DeliveryReceipt]:
+    """用原回执重放分层投递，核对修订是否只增加有效数据。
+
+    已登记收据原样返回、不重复登记；报告新批准的分区才会产生新收据。
+    """
+    _, receipts = deliver_approved_partitions(batch, report)
+    return receipts
+
+
+def lookup_receipt(receipt_id: str) -> DeliveryReceipt | None:
+    """按收据编号回查（周报凭据回查入口）。"""
+    return _receipt_registry.get(receipt_id)
+
+
+def list_batch_receipts(batch_id: str) -> list[DeliveryReceipt]:
+    """列出批次的全部签收收据，按分区排序，供周报核对。"""
+    return sorted(
+        (item for item in _receipt_registry.values() if item.target_batch == batch_id),
+        key=lambda item: item.partition,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 流水线 5: incr_crawl → crawl_job → diff_check
 # ---------------------------------------------------------------------------
 
@@ -614,8 +786,56 @@ def _persist_delivery(dt: DeliveryTask) -> None:
             ("投递频率", "frequency"), ("分区策略", "partition_strategy"),
             ("最近投递", "last_delivery"), ("投递状态", "status"),
         ]},
+        放行报告=dt.release_report_id,
+        已投分区=",".join(dt.delivered_partitions),
+        收据编号=",".join(dt.receipt_ids),
+        投递行数=dt.delivered_row_count,
         status=dt.status, pending=False, abnormal=dt.status == "投递失败",
     ))
+
+
+def _persist_layered_report(report: LayeredReleaseReport) -> None:
+    rows = store.rows("layered_release")
+    detail = "；".join(
+        f"{s.zone}:{s.status}(采样{s.sample_size}/有效{s.valid_count}/"
+        f"有效率{s.valid_rate:.0%}/{s.reason()})"
+        for s in report.strata
+    )
+    rows.append({
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        "报告编号": report.report_id,
+        "目标批次": report.target_batch,
+        "修订版本": report.revision,
+        "最小样本": report.min_samples,
+        "有效率阈值": f"{report.valid_rate_threshold:.0%}",
+        "批准分区": ",".join(report.approved_zones),
+        "未放行分区": ",".join(report.rejected_zones),
+        "分区明细": detail,
+        "出具时间": report.created_at,
+        "status": report.status,
+        "pending": report.status != "全部放行",
+        "abnormal": bool(report.rejected_zones),
+    })
+
+
+def _persist_receipt(receipt: DeliveryReceipt) -> None:
+    rows = store.rows("delivery_receipt")
+    rows.append({
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        "收据编号": receipt.receipt_id,
+        "报告编号": receipt.report_id,
+        "目标批次": receipt.target_batch,
+        "任务编号": receipt.task_id,
+        "目标系统": receipt.target_system,
+        "分区": receipt.partition,
+        "签收行数": receipt.row_count,
+        "采样数量": receipt.sample_size,
+        "有效数量": receipt.valid_count,
+        "签收时间": receipt.created_at,
+        "status": receipt.status,
+        "pending": False,
+        "abnormal": False,
+    })
 
 
 def _persist_sample(qs: QualitySample) -> None:

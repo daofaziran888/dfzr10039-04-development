@@ -14,6 +14,8 @@ from app.services.incr_crawl import IncrCrawlService
 from app.services.parse_log import ParseLogService
 from app.services.data_delivery import DataDeliveryService
 from app.services.quality_sample import QualitySampleService
+from app.services.layered_release import LayeredReleaseService
+from app.services.delivery_receipt import DeliveryReceiptService
 from app.services.site_monitor import SiteMonitorService
 from app.services.robot_verify import RobotVerifyService
 from app.services.crawl_limit import CrawlLimitService
@@ -38,6 +40,8 @@ SERVICES: dict[str, BaseModuleService] = {
     "parse_log": ParseLogService(),
     "data_delivery": DataDeliveryService(),
     "quality_sample": QualitySampleService(),
+    "layered_release": LayeredReleaseService(),
+    "delivery_receipt": DeliveryReceiptService(),
     "site_monitor": SiteMonitorService(),
     "robot_verify": RobotVerifyService(),
     "crawl_limit": CrawlLimitService(),

@@ -341,6 +341,10 @@ class DeliveryTask:
     status: str = "待投递"
     batch_ref_id: str = ""
     delivered_row_count: int = 0
+    # 分层放行：任务只投递报告中已批准的分区，结论同步自分层放行报告。
+    release_report_id: str = ""
+    delivered_partitions: list[str] = field(default_factory=list)
+    receipt_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> DeliveryTask:
@@ -349,6 +353,10 @@ class DeliveryTask:
             df = DeliveryFormat(df_str)
         except ValueError:
             df = DeliveryFormat.CSV
+
+        def _split(value: Any) -> list[str]:
+            return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
         return cls(
             task_id=str(row.get("任务编号", "")),
             data_source=str(row.get("数据来源", "")),
@@ -358,6 +366,9 @@ class DeliveryTask:
             partition_strategy=str(row.get("分区策略", "")),
             last_delivery=str(row.get("最近投递", "")),
             status=str(row.get("status", "待投递")),
+            release_report_id=str(row.get("放行报告", "")),
+            delivered_partitions=_split(row.get("已投分区")),
+            receipt_ids=_split(row.get("收据编号")),
         )
 
 
@@ -405,6 +416,110 @@ class QualitySample:
             last_sampled=str(row.get("最近采样", "")),
             status=str(row.get("status", "待采样")),
         )
+
+
+@dataclass
+class StratumSampleResult:
+    """单个分区（同批次不同来源）的分层采样结果。
+
+    放行条件（必须同时满足）：
+    - 采样数量达到规则要求的最小样本数；
+    - 有效率（有效样本 / 采样数量）达到有效率阈值。
+    任一不满足即不放行，且该分区不得登记为已收。
+    """
+    zone: str
+    total_rows: int
+    sample_size: int
+    valid_count: int
+    min_samples: int
+    valid_rate_threshold: float
+    delivered_rows: int = 0
+    status: str = "未放行"
+
+    @property
+    def valid_rate(self) -> float:
+        return self.valid_count / self.sample_size if self.sample_size else 0.0
+
+    @property
+    def meets_min_samples(self) -> bool:
+        return self.sample_size >= self.min_samples
+
+    @property
+    def meets_valid_rate(self) -> bool:
+        return self.sample_size > 0 and self.valid_rate >= self.valid_rate_threshold
+
+    @property
+    def approved(self) -> bool:
+        return self.meets_min_samples and self.meets_valid_rate
+
+    def evaluate(self) -> "StratumSampleResult":
+        self.status = "已批准" if self.approved else "未放行"
+        return self
+
+    def reason(self) -> str:
+        if self.meets_min_samples and self.meets_valid_rate:
+            return f"样本{self.sample_size}条≥{self.min_samples}，有效率{self.valid_rate:.0%}达标"
+        reasons: list[str] = []
+        if not self.meets_min_samples:
+            reasons.append(f"样本{self.sample_size}条低于下限{self.min_samples}条")
+        if not self.meets_valid_rate:
+            reasons.append(f"有效率{self.valid_rate:.0%}低于阈值{self.valid_rate_threshold:.0%}")
+        return "；".join(reasons)
+
+
+@dataclass
+class LayeredReleaseReport:
+    """分层放行报告：按分区给出最小样本数与有效率阈值的放行结论。
+
+    同一批次补检后会生成新的修订版报告（revision 递增），
+    已出具的报告与已签收范围保持原样、不被覆盖，只允许增量追加。
+    """
+    report_id: str
+    target_batch: str
+    min_samples: int
+    valid_rate_threshold: float
+    strata: list[StratumSampleResult] = field(default_factory=list)
+    revision: int = 1
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "待评审"
+
+    @property
+    def approved_zones(self) -> list[str]:
+        return [s.zone for s in self.strata if s.status == "已批准"]
+
+    @property
+    def rejected_zones(self) -> list[str]:
+        return [s.zone for s in self.strata if s.status != "已批准"]
+
+    @property
+    def all_approved(self) -> bool:
+        return bool(self.strata) and all(s.status == "已批准" for s in self.strata)
+
+    def finalize(self) -> "LayeredReleaseReport":
+        for stratum in self.strata:
+            stratum.evaluate()
+        self.status = "全部放行" if self.all_approved else "部分放行"
+        return self
+
+
+@dataclass
+class DeliveryReceipt:
+    """投递收据：登记实际投递的分区和行数，作为下游签收与回查凭据。
+
+    收据一旦登记即不可变；补检回执重复提交只记一次（按 receipt_id 幂等），
+    已签收范围的后续更正只能新增有效数据，不能改动历史收据。
+    """
+    receipt_id: str
+    report_id: str
+    target_batch: str
+    task_id: str
+    target_system: str
+    partition: str
+    row_count: int
+    sample_size: int
+    valid_count: int
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "已签收"
 
 
 @dataclass
